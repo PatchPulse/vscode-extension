@@ -4,6 +4,7 @@
   "description": "Keep a pulse on npm package updates!",
   "version": "0.0.1",
   "publisher": "patch-pulse",
+  "license": "MIT",
   "engines": {
     "vscode": "1.96.2"
   },
