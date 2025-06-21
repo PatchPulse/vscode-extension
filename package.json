@@ -1,7 +1,7 @@
 {
   "name": "patch-pulse",
   "displayName": "Patch Pulse",
-  "description": "Keep a pulse on npm package updates!",
+  "description": "Keep a pulse on npm package updates! Shows inline version information for packages in package.json files.",
   "version": "0.0.1",
   "publisher": "patch-pulse",
   "license": "MIT",
@@ -11,14 +11,41 @@
   "categories": [
     "Other"
   ],
+  "activationEvents": [
+    "onLanguage:json"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "patch-pulse.helloWorld",
-        "title": "Hello World"
+        "command": "patch-pulse.checkVersions",
+        "title": "Check Package Versions"
+      },
+      {
+        "command": "patch-pulse.refreshVersions",
+        "title": "Refresh Package Versions"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Patch Pulse",
+      "properties": {
+        "patchPulse.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable/disable Patch Pulse functionality"
+        },
+        "patchPulse.checkOnOpen": {
+          "type": "boolean",
+          "default": true,
+          "description": "Check versions when package.json files are opened"
+        },
+        "patchPulse.updateInterval": {
+          "type": "number",
+          "default": 3600,
+          "description": "Update interval in seconds (default: 1 hour)"
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
@@ -46,5 +73,8 @@
     "typescript": "5.8.3",
     "@vscode/test-cli": "0.0.11",
     "@vscode/test-electron": "2.5.2"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2"
   }
 }
