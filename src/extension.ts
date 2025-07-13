@@ -1,8 +1,6 @@
 // The module 'vscode' contains the VS Code extensibility API
 // Import the module and reference it with the alias vscode in your code below
 import * as vscode from "vscode";
-import * as path from "path";
-import * as fs from "fs";
 
 interface PackageInfo {
   name: string;
@@ -25,6 +23,10 @@ class PatchPulseProvider {
     { version: string; timestamp: number }
   >();
   private readonly CACHE_DURATION = 3600000; // 1 hour in milliseconds
+  private outputChannel: vscode.OutputChannel;
+
+  private updateTimeout: NodeJS.Timeout | undefined;
+  private pendingUpdates = new Map<vscode.TextEditor, PackageInfo[]>();
 
   constructor() {
     // Create decoration type for package version annotations
@@ -34,10 +36,13 @@ class PatchPulseProvider {
         color: new vscode.ThemeColor("editorComment.foreground"),
       },
     });
+
+    this.outputChannel = vscode.window.createOutputChannel("Patch Pulse");
   }
 
   public async activate(context: vscode.ExtensionContext) {
-    console.log("=== PATCH PULSE EXTENSION ACTIVATING ===");
+    this.outputChannel.appendLine("=== PATCH PULSE EXTENSION ACTIVATING ===");
+    this.outputChannel.show();
 
     // Register commands
     const checkVersionsCommand = vscode.commands.registerCommand(
@@ -88,7 +93,9 @@ class PatchPulseProvider {
       this.decorationType
     );
 
-    console.log("=== PATCH PULSE EXTENSION ACTIVATED SUCCESSFULLY ===");
+    this.outputChannel.appendLine(
+      "=== PATCH PULSE EXTENSION ACTIVATED SUCCESSFULLY ==="
+    );
   }
 
   private isPackageJsonFile(document: vscode.TextDocument): boolean {
@@ -116,14 +123,59 @@ class PatchPulseProvider {
         return;
       }
 
-      // Check versions for all packages
-      await this.checkPackageVersions(packages);
+      packages.forEach((pkg) => {
+        pkg.latestVersion = "loading";
+      });
 
-      // Update decorations
+      /**
+       * Shows loading state immediately.
+       */
       this.updateDecorations(editor, packages);
+
+      this.checkPackageVersionsStreaming(editor, packages);
     } catch (error) {
-      console.error("Error checking package versions:", error);
+      this.outputChannel.appendLine(
+        `Error checking package versions: ${error}`
+      );
     }
+  }
+
+  private async checkPackageVersionsStreaming(
+    editor: vscode.TextEditor,
+    packages: PackageInfo[]
+  ) {
+    const promises = packages.map(async (pkg) => {
+      try {
+        const lastVersion = await this.getLatestVersion(pkg.name);
+        pkg.latestVersion = lastVersion;
+        this.scheduleUpdate(editor, packages);
+      } catch (error) {
+        this.outputChannel.appendLine(
+          `Error checking version for ${pkg.name}: ${error}`
+        );
+        pkg.latestVersion = "error";
+        this.scheduleUpdate(editor, packages);
+      }
+    });
+
+    await Promise.all(promises);
+  }
+
+  private scheduleUpdate(editor: vscode.TextEditor, packages: PackageInfo[]) {
+    this.pendingUpdates.set(editor, packages);
+
+    if (this.updateTimeout) {
+      clearTimeout(this.updateTimeout);
+    }
+
+    this.updateTimeout = setTimeout(() => {});
+
+    this.updateTimeout = setTimeout(() => {
+      this.pendingUpdates.forEach((packages, editor) => {
+        this.updateDecorations(editor, packages);
+      });
+      this.pendingUpdates.clear();
+    }, 1_000);
   }
 
   private parsePackageJson(document: vscode.TextDocument): PackageInfo[] {
@@ -209,19 +261,6 @@ class PatchPulseProvider {
     return -1;
   }
 
-  private async checkPackageVersions(packages: PackageInfo[]) {
-    const promises = packages.map(async (pkg) => {
-      try {
-        const latestVersion = await this.getLatestVersion(pkg.name);
-        pkg.latestVersion = latestVersion;
-      } catch (error) {
-        console.error(`Error getting version for ${pkg.name}:`, error);
-      }
-    });
-
-    await Promise.all(promises);
-  }
-
   private async getLatestVersion(packageName: string): Promise<string> {
     const cacheKey = packageName;
     const cached = this.packageCache.get(cacheKey);
@@ -231,15 +270,29 @@ class PatchPulseProvider {
     }
 
     try {
-      const response = await fetch(`https://registry.npmjs.org/${packageName}`);
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
-      }
+      const https = require("https");
+      const url = `https://registry.npmjs.org/${packageName}`;
 
-      const data = (await response.json()) as NpmPackageData;
-      const latestVersion = data["dist-tags"].latest;
+      const response = await new Promise<any>((resolve, reject) => {
+        https
+          .get(url, (res: any) => {
+            let data = "";
+            res.on("data", (chunk: any) => {
+              data += chunk;
+            });
+            res.on("end", () => {
+              try {
+                resolve(JSON.parse(data));
+              } catch (e) {
+                reject(e);
+              }
+            });
+          })
+          .on("error", reject);
+      });
 
-      // Cache the result
+      const latestVersion = response["dist-tags"].latest;
+
       this.packageCache.set(cacheKey, {
         version: latestVersion,
         timestamp: Date.now(),
@@ -247,7 +300,9 @@ class PatchPulseProvider {
 
       return latestVersion;
     } catch (error) {
-      console.error(`Failed to fetch version for ${packageName}:`, error);
+      this.outputChannel.appendLine(
+        `Failed to fetch version for ${packageName}: ${error}`
+      );
       throw error;
     }
   }
@@ -259,10 +314,6 @@ class PatchPulseProvider {
     const decorations: vscode.DecorationOptions[] = [];
 
     for (const pkg of packages) {
-      if (!pkg.latestVersion) {
-        continue;
-      }
-
       const line = editor.document.lineAt(pkg.line);
       const range = new vscode.Range(
         pkg.line,
@@ -271,24 +322,46 @@ class PatchPulseProvider {
         line.text.length
       );
 
-      const isOutdated = this.isVersionOutdated(
-        pkg.currentVersion,
-        pkg.latestVersion
-      );
-      const color = isOutdated ? "#ff6b6b" : "#51cf66";
-      const status = isOutdated ? "outdated" : "up to date";
+      let decoration: vscode.DecorationOptions;
 
-      const decoration: vscode.DecorationOptions = {
-        range,
-        renderOptions: {
-          after: {
-            contentText: ` 📦 ${pkg.latestVersion} (${status})`,
-            color: color,
-            fontWeight: "normal",
-            fontStyle: "italic",
+      if (!pkg.latestVersion || pkg.latestVersion === "error") {
+        continue;
+      }
+
+      if (pkg.latestVersion === "loading") {
+        decoration = {
+          range,
+          renderOptions: {
+            after: {
+              contentText: "checking...",
+              color: new vscode.ThemeColor("editorComment.foreground"),
+              fontWeight: "normal",
+              fontStyle: "italic",
+            },
           },
-        },
-      };
+        };
+      } else {
+        const isOutdated = this.isVersionOutdated(
+          pkg.currentVersion,
+          pkg.latestVersion
+        );
+
+        const contentText = isOutdated
+          ? `new version available: ${pkg.latestVersion}`
+          : `up to date`;
+
+        decoration = {
+          range,
+          renderOptions: {
+            after: {
+              contentText,
+              color: isOutdated ? "yellow" : "green",
+              fontWeight: "normal",
+              fontStyle: "italic",
+            },
+          },
+        };
+      }
 
       decorations.push(decoration);
     }
@@ -307,7 +380,12 @@ class PatchPulseProvider {
   }
 
   public dispose() {
+    if (this.updateTimeout) {
+      clearTimeout(this.updateTimeout);
+    }
+
     this.decorationType.dispose();
+    this.outputChannel.dispose();
   }
 }
 
