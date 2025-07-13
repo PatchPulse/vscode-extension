@@ -8,12 +8,7 @@ interface PackageInfo {
   latestVersion?: string;
   line: number;
   range: vscode.Range;
-}
-
-interface NpmPackageData {
-  "dist-tags": {
-    latest: string;
-  };
+  status: "loading" | "success" | "error" | "not-found" | "timeout";
 }
 
 class PatchPulseProvider {
@@ -25,15 +20,20 @@ class PatchPulseProvider {
   private readonly CACHE_DURATION = 3600000; // 1 hour in milliseconds
   private outputChannel: vscode.OutputChannel;
 
-  private updateTimeout: NodeJS.Timeout | undefined;
-  private pendingUpdates = new Map<vscode.TextEditor, PackageInfo[]>();
+  private failedPackages = new Map<
+    string,
+    { attempts: number; lastAttempt: number }
+  >();
+  private readonly MAX_ATTEMPTS = 3;
+  private readonly RETRY_DELAY = 30_000;
+  private readonly REQUEST_TIMEOUT = 10_000;
 
   constructor() {
     // Create decoration type for package version annotations
     this.decorationType = vscode.window.createTextEditorDecorationType({
       after: {
         margin: "0 0 0 1em",
-        color: new vscode.ThemeColor("editorComment.foreground"),
+        color: "#6a737d", // Use a neutral gray color that works across themes
       },
     });
 
@@ -57,6 +57,14 @@ class PatchPulseProvider {
       () => {
         this.clearCache();
         this.checkVersionsForActiveEditor();
+      }
+    );
+
+    // Move this INTO the activate method
+    const retryFailedCommand = vscode.commands.registerCommand(
+      "patch-pulse.retryFailed",
+      () => {
+        this.retryFailedPackages();
       }
     );
 
@@ -89,6 +97,7 @@ class PatchPulseProvider {
     context.subscriptions.push(
       checkVersionsCommand,
       refreshVersionsCommand,
+      retryFailedCommand, // Add this line
       fileWatcher,
       this.decorationType
     );
@@ -123,16 +132,16 @@ class PatchPulseProvider {
         return;
       }
 
+      // Initialize all packages as loading
       packages.forEach((pkg) => {
-        pkg.latestVersion = "loading";
+        pkg.status = "loading";
+        pkg.latestVersion = undefined;
       });
 
-      /**
-       * Shows loading state immediately.
-       */
       this.updateDecorations(editor, packages);
 
-      this.checkPackageVersionsStreaming(editor, packages);
+      // Process packages with timeout
+      await this.fetchPackageVersions(editor, packages);
     } catch (error) {
       this.outputChannel.appendLine(
         `Error checking package versions: ${error}`
@@ -140,42 +149,340 @@ class PatchPulseProvider {
     }
   }
 
-  private async checkPackageVersionsStreaming(
+  private async fetchPackageVersions(
     editor: vscode.TextEditor,
     packages: PackageInfo[]
   ) {
     const promises = packages.map(async (pkg) => {
       try {
-        const lastVersion = await this.getLatestVersion(pkg.name);
-        pkg.latestVersion = lastVersion;
-        this.scheduleUpdate(editor, packages);
-      } catch (error) {
-        this.outputChannel.appendLine(
-          `Error checking version for ${pkg.name}: ${error}`
+        // Check if we should skip this package due to recent failures
+        const failureInfo = this.failedPackages.get(pkg.name);
+        if (failureInfo && failureInfo.attempts >= this.MAX_ATTEMPTS) {
+          const timeSinceLastAttempt = Date.now() - failureInfo.lastAttempt;
+          if (timeSinceLastAttempt < this.RETRY_DELAY) {
+            pkg.status = "error";
+            pkg.latestVersion = "max-retries";
+            return;
+          }
+        }
+
+        const version = await this.getLatestVersionWithTimeout(
+          pkg.name,
+          this.REQUEST_TIMEOUT
         );
-        pkg.latestVersion = "error";
-        this.scheduleUpdate(editor, packages);
+        pkg.latestVersion = version;
+        pkg.status = "success";
+
+        // Clear failure info on success
+        this.failedPackages.delete(pkg.name);
+      } catch (error) {
+        this.handlePackageFailure(pkg, error);
       }
     });
 
     await Promise.all(promises);
+    this.updateDecorations(editor, packages);
   }
 
-  private scheduleUpdate(editor: vscode.TextEditor, packages: PackageInfo[]) {
-    this.pendingUpdates.set(editor, packages);
+  private async getLatestVersionWithTimeout(
+    packageName: string,
+    timeoutMs: number
+  ): Promise<string> {
+    const cacheKey = packageName;
+    const cached = this.packageCache.get(cacheKey);
 
-    if (this.updateTimeout) {
-      clearTimeout(this.updateTimeout);
+    if (cached && Date.now() - cached.timestamp < this.CACHE_DURATION) {
+      return cached.version;
     }
 
-    this.updateTimeout = setTimeout(() => {});
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        reject(new Error("TIMEOUT"));
+      }, timeoutMs);
 
-    this.updateTimeout = setTimeout(() => {
-      this.pendingUpdates.forEach((packages, editor) => {
-        this.updateDecorations(editor, packages);
+      const https = require("https");
+      const url = `https://registry.npmjs.org/${packageName}`;
+
+      const options = {
+        timeout: timeoutMs - 1_000,
+        headers: {
+          "User-Agent": "VSCode-PatchPulse-Extension",
+        },
+      };
+
+      const req = https.get(url, options, (res: any) => {
+        let data = "";
+
+        if (res.statusCode === 404) {
+          clearTimeout(timeout);
+          reject(new Error("NOT_FOUND"));
+          return;
+        }
+
+        if (res.statusCode === 429) {
+          clearTimeout(timeout);
+          reject(new Error("RATE_LIMITED"));
+          return;
+        }
+
+        if (res.statusCode !== 200) {
+          clearTimeout(timeout);
+          reject(new Error(`HTTP_${res.statusCode}`));
+          return;
+        }
+
+        res.on("data", (chunk: any) => {
+          data += chunk;
+        });
+
+        res.on("end", () => {
+          clearTimeout(timeout);
+          try {
+            const response = JSON.parse(data);
+            const latestVersion = response["dist-tags"]?.latest;
+
+            if (!latestVersion) {
+              reject(new Error("NO_LATEST_VERSION"));
+              return;
+            }
+
+            this.packageCache.set(packageName, {
+              version: latestVersion,
+              timestamp: Date.now(),
+            });
+
+            resolve(latestVersion);
+          } catch (e) {
+            reject(new Error("PARSE_ERROR"));
+          }
+        });
+
+        res.on("error", (error: any) => {
+          clearTimeout(timeout);
+          reject(new Error("RESPONSE_ERROR"));
+        });
       });
-      this.pendingUpdates.clear();
-    }, 1_000);
+
+      req.on("timeout", () => {
+        req.destroy();
+        clearTimeout(timeout);
+        reject(new Error("REQUEST_TIMEOUT"));
+      });
+
+      req.on("error", (error: any) => {
+        clearTimeout(timeout);
+        reject(new Error("NETWORK_ERROR"));
+      });
+    });
+  }
+
+  private handlePackageFailure(pkg: PackageInfo, error: any) {
+    const errorMessage = error.message || error.toString();
+
+    if (errorMessage.includes("NOT_FOUND")) {
+      pkg.status = "not-found";
+      pkg.latestVersion = "not-found";
+      this.outputChannel.appendLine(
+        `Package '${pkg.name}' not found in registry`
+      );
+      return;
+    }
+
+    // Track failure attempts
+    const failureInfo = this.failedPackages.get(pkg.name) || {
+      attempts: 0,
+      lastAttempt: 0,
+    };
+    failureInfo.attempts++;
+    failureInfo.lastAttempt = Date.now();
+    this.failedPackages.set(pkg.name, failureInfo);
+
+    if (
+      errorMessage.includes("TIMEOUT") ||
+      errorMessage.includes("REQUEST_TIMEOUT")
+    ) {
+      pkg.status = "timeout";
+      pkg.latestVersion = "timeout";
+    } else if (errorMessage.includes("RATE_LIMITED")) {
+      pkg.status = "error";
+      pkg.latestVersion = "rate-limited";
+    } else {
+      pkg.status = "error";
+      pkg.latestVersion = "error";
+    }
+
+    this.outputChannel.appendLine(
+      `Error fetching '${pkg.name}': ${errorMessage} (attempt ${failureInfo.attempts}/${this.MAX_ATTEMPTS})`
+    );
+  }
+
+  private updateDecorations(
+    editor: vscode.TextEditor,
+    packages: PackageInfo[]
+  ) {
+    const decorations: vscode.DecorationOptions[] = [];
+
+    for (const pkg of packages) {
+      const line = editor.document.lineAt(pkg.line);
+      const range = new vscode.Range(
+        pkg.line,
+        line.text.length,
+        pkg.line,
+        line.text.length
+      );
+
+      let decoration: vscode.DecorationOptions;
+
+      switch (pkg.status) {
+        case "loading":
+          decoration = {
+            range,
+            renderOptions: {
+              after: {
+                contentText: " ⏳ checking...",
+                color: "#6a737d",
+                fontWeight: "normal",
+                fontStyle: "italic",
+              },
+            },
+          };
+          break;
+
+        case "not-found":
+          decoration = {
+            range,
+            renderOptions: {
+              after: {
+                contentText: " ❓ package not found",
+                color: "#ff9500",
+                fontWeight: "normal",
+                fontStyle: "italic",
+              },
+            },
+          };
+          break;
+
+        case "timeout":
+          const failureInfo = this.failedPackages.get(pkg.name);
+          const attempts = failureInfo ? failureInfo.attempts : 0;
+
+          decoration = {
+            range,
+            renderOptions: {
+              after: {
+                contentText: ` ⏱️ slow network (${attempts}/${this.MAX_ATTEMPTS})`,
+                color: "#ff6b6b",
+                fontWeight: "normal",
+                fontStyle: "italic",
+              },
+            },
+          };
+          break;
+
+        case "error":
+          const errorFailureInfo = this.failedPackages.get(pkg.name);
+          const isMaxRetries =
+            errorFailureInfo && errorFailureInfo.attempts >= this.MAX_ATTEMPTS;
+          const errorAttempts = errorFailureInfo
+            ? errorFailureInfo.attempts
+            : 0;
+
+          let errorText = " ❌ error";
+          if (pkg.latestVersion === "rate-limited") {
+            errorText = " 🚦 rate limited";
+          }
+
+          decoration = {
+            range,
+            renderOptions: {
+              after: {
+                contentText: isMaxRetries
+                  ? `${errorText} (max retries reached)`
+                  : `${errorText} (${errorAttempts}/${this.MAX_ATTEMPTS})`,
+                color: "#ff6b6b",
+                fontWeight: "normal",
+                fontStyle: "italic",
+              },
+            },
+          };
+          break;
+
+        case "success":
+          if (pkg.latestVersion) {
+            const isOutdated = this.isVersionOutdated(
+              pkg.currentVersion,
+              pkg.latestVersion
+            );
+            const contentText = isOutdated
+              ? ` ⚠️ ${pkg.latestVersion} available`
+              : ` ✅ up to date`;
+
+            decoration = {
+              range,
+              renderOptions: {
+                after: {
+                  contentText,
+                  color: isOutdated ? "#ffc107" : "#28a745",
+                  fontWeight: "normal",
+                  fontStyle: "italic",
+                },
+              },
+            };
+          } else {
+            continue;
+          }
+          break;
+
+        default:
+          continue;
+      }
+
+      decorations.push(decoration);
+    }
+
+    editor.setDecorations(this.decorationType, decorations);
+  }
+
+  private async retryFailedPackages() {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || !this.isPackageJsonFile(editor.document)) {
+      vscode.window.showInformationMessage("Please open a package.json file");
+      return;
+    }
+
+    // Get current packages
+    const packages = this.parsePackageJson(editor.document);
+    if (packages.length === 0) {
+      return;
+    }
+
+    // Find packages that need retrying (failed or timeout status)
+    const failedPackages = packages.filter(
+      (pkg) => pkg.status === "error" || pkg.status === "timeout"
+    );
+
+    if (failedPackages.length === 0) {
+      vscode.window.showInformationMessage("No failed packages to retry");
+      return;
+    }
+
+    // Clear failure history to allow retries
+    this.failedPackages.clear();
+    vscode.window.showInformationMessage(
+      `Retrying ${failedPackages.length} failed packages...`
+    );
+
+    // Set only failed packages to loading
+    failedPackages.forEach((pkg) => {
+      pkg.status = "loading";
+      pkg.latestVersion = undefined;
+    });
+
+    // Update decorations to show loading state for failed packages
+    this.updateDecorations(editor, packages);
+
+    // Retry only the failed packages
+    await this.fetchPackageVersions(editor, packages);
   }
 
   private parsePackageJson(document: vscode.TextDocument): PackageInfo[] {
@@ -235,6 +542,7 @@ class PatchPulseProvider {
           currentVersion: versionStr,
           line: packageLine,
           range: new vscode.Range(packageLine, 0, packageLine, 0),
+          status: "success",
         });
       }
     }
@@ -261,114 +569,6 @@ class PatchPulseProvider {
     return -1;
   }
 
-  private async getLatestVersion(packageName: string): Promise<string> {
-    const cacheKey = packageName;
-    const cached = this.packageCache.get(cacheKey);
-
-    if (cached && Date.now() - cached.timestamp < this.CACHE_DURATION) {
-      return cached.version;
-    }
-
-    try {
-      const https = require("https");
-      const url = `https://registry.npmjs.org/${packageName}`;
-
-      const response = await new Promise<any>((resolve, reject) => {
-        https
-          .get(url, (res: any) => {
-            let data = "";
-            res.on("data", (chunk: any) => {
-              data += chunk;
-            });
-            res.on("end", () => {
-              try {
-                resolve(JSON.parse(data));
-              } catch (e) {
-                reject(e);
-              }
-            });
-          })
-          .on("error", reject);
-      });
-
-      const latestVersion = response["dist-tags"].latest;
-
-      this.packageCache.set(cacheKey, {
-        version: latestVersion,
-        timestamp: Date.now(),
-      });
-
-      return latestVersion;
-    } catch (error) {
-      this.outputChannel.appendLine(
-        `Failed to fetch version for ${packageName}: ${error}`
-      );
-      throw error;
-    }
-  }
-
-  private updateDecorations(
-    editor: vscode.TextEditor,
-    packages: PackageInfo[]
-  ) {
-    const decorations: vscode.DecorationOptions[] = [];
-
-    for (const pkg of packages) {
-      const line = editor.document.lineAt(pkg.line);
-      const range = new vscode.Range(
-        pkg.line,
-        line.text.length,
-        pkg.line,
-        line.text.length
-      );
-
-      let decoration: vscode.DecorationOptions;
-
-      if (!pkg.latestVersion || pkg.latestVersion === "error") {
-        continue;
-      }
-
-      if (pkg.latestVersion === "loading") {
-        decoration = {
-          range,
-          renderOptions: {
-            after: {
-              contentText: "checking...",
-              color: new vscode.ThemeColor("editorComment.foreground"),
-              fontWeight: "normal",
-              fontStyle: "italic",
-            },
-          },
-        };
-      } else {
-        const isOutdated = this.isVersionOutdated(
-          pkg.currentVersion,
-          pkg.latestVersion
-        );
-
-        const contentText = isOutdated
-          ? `new version available: ${pkg.latestVersion}`
-          : `up to date`;
-
-        decoration = {
-          range,
-          renderOptions: {
-            after: {
-              contentText,
-              color: isOutdated ? "yellow" : "green",
-              fontWeight: "normal",
-              fontStyle: "italic",
-            },
-          },
-        };
-      }
-
-      decorations.push(decoration);
-    }
-
-    editor.setDecorations(this.decorationType, decorations);
-  }
-
   private isVersionOutdated(current: string, latest: string): boolean {
     // Simple version comparison - you might want to use a proper semver library
     const currentClean = current.replace(/[\^~]/, "");
@@ -380,10 +580,6 @@ class PatchPulseProvider {
   }
 
   public dispose() {
-    if (this.updateTimeout) {
-      clearTimeout(this.updateTimeout);
-    }
-
     this.decorationType.dispose();
     this.outputChannel.dispose();
   }
