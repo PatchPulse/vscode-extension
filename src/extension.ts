@@ -2,7 +2,6 @@ import * as vscode from "vscode";
 
 import { activateLogger, disposeLogger, log } from "./services/logger";
 import { isEditorPackageJsonFile } from "./utils/isEditorPackageJsonFile";
-import { getPackageLineNumber } from "./utils/getPackageLineNumber";
 import { createRangeFromPackageName } from "./utils/createRangeFromLineNumber";
 
 const decorationType = vscode.window.createTextEditorDecorationType({
@@ -16,17 +15,21 @@ export function activate(context: vscode.ExtensionContext) {
   vscode.window.onDidChangeActiveTextEditor((editor) => {
     const isPackageJsonFile = isEditorPackageJsonFile(editor);
     if (!isPackageJsonFile) {
-      return; // Don't do anything if the active editor is not a package.json file.
+      return;
+    }
+    const packageJsonDocument = editor?.document;
+    if (!packageJsonDocument) {
+      return;
     }
     log("=== PACKAGE.JSON FILE ACTIVE ===");
 
-    const packageJsonDocument = editor?.document;
-    if (!packageJsonDocument) {
-      return; // Don't do anything if the active editor is not a package.json file.
-    }
-
     const packageJsonDocumentText = packageJsonDocument.getText();
     const packageJson = JSON.parse(packageJsonDocumentText);
+
+    const decorations: {
+      range: vscode.Range;
+      renderOptions: vscode.DecorationRenderOptions;
+    }[] = [];
 
     for (const [packageName, version] of Object.entries(
       packageJson.dependencies
@@ -58,33 +61,21 @@ export function activate(context: vscode.ExtensionContext) {
             return;
           }
 
-          const isOutdated = version !== latestVersion; // TODO: refine this
-
-          const range = createRangeFromPackageName(
-            packageJsonDocument,
-            packageName
-          );
-
-          editor?.setDecorations(decorationType, [
-            {
-              range,
-              renderOptions: {
-                after: {
-                  contentText: isOutdated
+          decorations.push({
+            range: createRangeFromPackageName(packageJsonDocument, packageName),
+            renderOptions: {
+              after: {
+                contentText:
+                  version !== latestVersion
                     ? `new version available (${latestVersion})`
                     : "up to date",
-                  fontStyle: "italic",
-                  color: "#888888",
-                },
+                fontStyle: "italic",
+                color: "#888888",
               },
             },
-          ]);
+          });
 
-          if (isOutdated) {
-            log(
-              `Package ${packageName} is outdated. Current: ${version}, Latest: ${latestVersion}`
-            );
-          }
+          editor?.setDecorations(decorationType, decorations);
         });
       });
     }
