@@ -1,10 +1,17 @@
 import * as vscode from "vscode";
 
-import { getPackageInfo } from "./api/npm";
 import { activateLogger, disposeLogger, log } from "./services/logger";
-import { packageCache } from "./services/packageCache";
+import {
+  packageCache,
+  startCacheCleanup,
+  stopCacheCleanup,
+} from "./services/packageCache";
 import { isEditorPackageJsonFile } from "./utils/isEditorPackageJsonFile";
 import { createDecoration } from "./utils/createDecoration";
+import {
+  initializePreFetching,
+  setupFileWatchers,
+} from "./services/packagePreFetcher";
 
 const decorationType = vscode.window.createTextEditorDecorationType({
   after: { margin: "0 0 0 1em" },
@@ -15,9 +22,13 @@ const decorationType = vscode.window.createTextEditorDecorationType({
  */
 let decorationTimeout: NodeJS.Timeout | undefined;
 
-export function activate(_context: vscode.ExtensionContext) {
+export function activate(context: vscode.ExtensionContext) {
   activateLogger();
   log("=== PATCH PULSE EXTENSION ACTIVATED ===");
+
+  startCacheCleanup();
+  initializePreFetching();
+  setupFileWatchers(context);
 
   vscode.window.onDidChangeActiveTextEditor((editor) => {
     const isPackageJsonFile = isEditorPackageJsonFile(editor);
@@ -34,91 +45,110 @@ export function activate(_context: vscode.ExtensionContext) {
       clearTimeout(decorationTimeout);
     }
 
-    const packageJsonDocumentText = packageJsonDocument.getText();
-    const packageJson = JSON.parse(packageJsonDocumentText);
+    decorationTimeout = setTimeout(() => {
+      updateDecorationsForEditor(editor);
+    }, 200);
+  });
+}
 
-    const decorations: {
-      range: vscode.Range;
-      renderOptions: vscode.DecorationRenderOptions;
-    }[] = [];
+function updateDecorationsForEditor(editor: vscode.TextEditor) {
+  if (decorationTimeout) {
+    clearTimeout(decorationTimeout);
+  }
 
-    let pendingOperations = 0;
-    let hasCompletedOperations = false;
+  const packageJsonDocument = editor.document;
+  const packageJsonDocumentText = packageJsonDocument.getText();
 
-    function updateDecorations() {
-      if (!editor || decorations.length === 0) {
-        return;
-      }
+  let packageJson;
+  try {
+    packageJson = JSON.parse(packageJsonDocumentText);
+  } catch (error) {
+    log(`Error parsing package.json: ${error}`);
+    return;
+  }
 
-      editor.setDecorations(decorationType, decorations);
-      log(`Applied ${decorations.length} decorations.`);
-    }
+  // Use the same extraction logic as the prefetcher
+  const allDependencies = extractAllDependencies(packageJson);
 
-    function checkAndUpdateDecorations() {
-      pendingOperations--;
-      if (pendingOperations === 0 && hasCompletedOperations) {
-        decorationTimeout = setTimeout(updateDecorations, 100);
-      }
-    }
+  log(`Processing ${allDependencies.length} dependencies for decorations`);
 
-    for (const [packageName, version] of Object.entries(
-      packageJson.dependencies as Record<string, string>
-    )) {
-      const cachedPackageLatestVersion =
-        packageCache.getCachedPackageLatestVersion(packageName);
-      if (cachedPackageLatestVersion) {
-        log(
-          `${packageName}: CACHE FOUND! Latest version: ${cachedPackageLatestVersion}`
-        );
+  const decorations: {
+    range: vscode.Range;
+    renderOptions: vscode.DecorationRenderOptions;
+  }[] = [];
+
+  let cacheHits = 0;
+  let cacheMisses = 0;
+
+  // Process each dependency
+  for (const packageName of allDependencies) {
+    const cachedPackageLatestVersion =
+      packageCache.getCachedPackageLatestVersion(packageName);
+
+    if (cachedPackageLatestVersion) {
+      cacheHits++;
+      log(
+        `${packageName}: CACHE HIT! Latest version: ${cachedPackageLatestVersion}`
+      );
+
+      // Find the version in the package.json
+      const packageVersion = findPackageVersionInJson(packageJson, packageName);
+
+      if (packageVersion) {
         decorations.push(
           createDecoration({
             packageName,
-            currentVersion: version,
+            currentVersion: packageVersion,
             latestVersion: cachedPackageLatestVersion,
             packageJsonDocument,
           })
         );
-        hasCompletedOperations = true;
       } else {
-        log(`${packageName}: CACHE MISS! Fetching from npm...`);
-        pendingOperations++;
-        getPackageInfo(packageName)
-          .then((packageInfo) => {
-            const latestVersion = packageInfo["dist-tags"]?.latest;
-            if (!latestVersion) {
-              log(`No latest version found for package ${packageName}`);
-              checkAndUpdateDecorations();
-              return;
-            }
-
-            packageCache.setCachedVersion(packageName, latestVersion);
-
-            log(
-              `${packageName}: Latest version found from npm: ${latestVersion}`
-            );
-            decorations.push(
-              createDecoration({
-                packageName,
-                currentVersion: version,
-                latestVersion,
-                packageJsonDocument,
-              })
-            );
-
-            hasCompletedOperations = true;
-            checkAndUpdateDecorations();
-          })
-          .catch((error) => {
-            log(`Error fetching package ${packageName}: ${error}`);
-            checkAndUpdateDecorations();
-          });
+        log(
+          `Warning: Could not find version for ${packageName} in package.json`
+        );
       }
+    } else {
+      cacheMisses++;
+      log(`${packageName}: CACHE MISS! Should be pre-fetching...`);
     }
+  }
 
-    if (pendingOperations === 0 && hasCompletedOperations) {
-      decorationTimeout = setTimeout(updateDecorations, 100);
-    }
-  });
+  log(`Cache stats: ${cacheHits} hits, ${cacheMisses} misses`);
+
+  // Apply decorations immediately
+  if (decorations.length > 0) {
+    editor.setDecorations(decorationType, decorations);
+    log(`Applied ${decorations.length} decorations.`);
+  } else {
+    log("No decorations to apply - waiting for prefetch to complete");
+  }
+}
+
+// Helper function to find version in package.json
+function findPackageVersionInJson(
+  packageJson: any,
+  packageName: string
+): string | null {
+  return (
+    packageJson.dependencies?.[packageName] ||
+    packageJson.devDependencies?.[packageName] ||
+    packageJson.peerDependencies?.[packageName] ||
+    packageJson.optionalDependencies?.[packageName] ||
+    null
+  );
+}
+
+// Move this function to a shared utility file or copy it here
+function extractAllDependencies(packageJson: any): string[] {
+  const dependencies = {
+    ...packageJson.dependencies,
+    ...packageJson.devDependencies,
+    ...packageJson.peerDependencies,
+    ...packageJson.optionalDependencies,
+  };
+
+  return Object.keys(dependencies);
 }
 
 export function deactivate() {
@@ -126,5 +156,6 @@ export function deactivate() {
     clearTimeout(decorationTimeout);
   }
   decorationType.dispose();
+  stopCacheCleanup();
   disposeLogger();
 }
