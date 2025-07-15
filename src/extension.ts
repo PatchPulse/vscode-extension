@@ -1,14 +1,21 @@
 import * as vscode from "vscode";
 
+import { getPackageInfo } from "./api/npm";
 import { activateLogger, disposeLogger, log } from "./services/logger";
+import { packageCache } from "./services/packageCache";
 import { isEditorPackageJsonFile } from "./utils/isEditorPackageJsonFile";
-import { createRangeFromPackageName } from "./utils/createRangeFromLineNumber";
+import { createDecoration } from "./utils/createDecoration";
 
 const decorationType = vscode.window.createTextEditorDecorationType({
   after: { margin: "0 0 0 1em" },
 });
 
-export function activate(context: vscode.ExtensionContext) {
+/**
+ * Debounce timer for decoration updates.
+ */
+let decorationTimeout: NodeJS.Timeout | undefined;
+
+export function activate(_context: vscode.ExtensionContext) {
   activateLogger();
   log("=== PATCH PULSE EXTENSION ACTIVATED ===");
 
@@ -23,6 +30,10 @@ export function activate(context: vscode.ExtensionContext) {
     }
     log("=== PACKAGE.JSON FILE ACTIVE ===");
 
+    if (decorationTimeout) {
+      clearTimeout(decorationTimeout);
+    }
+
     const packageJsonDocumentText = packageJsonDocument.getText();
     const packageJson = JSON.parse(packageJsonDocumentText);
 
@@ -31,58 +42,89 @@ export function activate(context: vscode.ExtensionContext) {
       renderOptions: vscode.DecorationRenderOptions;
     }[] = [];
 
+    let pendingOperations = 0;
+    let hasCompletedOperations = false;
+
+    function updateDecorations() {
+      if (!editor || decorations.length === 0) {
+        return;
+      }
+
+      editor.setDecorations(decorationType, decorations);
+      log(`Applied ${decorations.length} decorations.`);
+    }
+
+    function checkAndUpdateDecorations() {
+      pendingOperations--;
+      if (pendingOperations === 0 && hasCompletedOperations) {
+        decorationTimeout = setTimeout(updateDecorations, 100);
+      }
+    }
+
     for (const [packageName, version] of Object.entries(
-      packageJson.dependencies
+      packageJson.dependencies as Record<string, string>
     )) {
-      // For each package, fetch the latest version from npm, and identify if it is outdated.
-      const https = require("https");
-      const url = `https://registry.npmjs.org/${packageName}`;
-      const options = {
-        headers: {
-          "User-Agent": "VSCode-PatchPulse-Extension",
-        },
-      };
+      const cachedPackageLatestVersion =
+        packageCache.getCachedPackageLatestVersion(packageName);
+      if (cachedPackageLatestVersion) {
+        log(
+          `${packageName}: CACHE FOUND! Latest version: ${cachedPackageLatestVersion}`
+        );
+        decorations.push(
+          createDecoration({
+            packageName,
+            currentVersion: version,
+            latestVersion: cachedPackageLatestVersion,
+            packageJsonDocument,
+          })
+        );
+        hasCompletedOperations = true;
+      } else {
+        log(`${packageName}: CACHE MISS! Fetching from npm...`);
+        pendingOperations++;
+        getPackageInfo(packageName)
+          .then((packageInfo) => {
+            const latestVersion = packageInfo["dist-tags"]?.latest;
+            if (!latestVersion) {
+              log(`No latest version found for package ${packageName}`);
+              checkAndUpdateDecorations();
+              return;
+            }
 
-      const req = https.get(url, options, (res: any) => {
-        let data = "";
-        res.on("data", (chunk: any) => {
-          data += chunk;
-        });
+            packageCache.setCachedVersion(packageName, latestVersion);
 
-        res.on("error", (err: any) => {
-          log(`Error fetching package ${packageName}: ${err}`);
-        });
+            log(
+              `${packageName}: Latest version found from npm: ${latestVersion}`
+            );
+            decorations.push(
+              createDecoration({
+                packageName,
+                currentVersion: version,
+                latestVersion,
+                packageJsonDocument,
+              })
+            );
 
-        res.on("end", () => {
-          const latestVersion = JSON.parse(data)["dist-tags"]?.latest;
-
-          if (!latestVersion) {
-            log(`No latest version found for package ${packageName}`);
-            return;
-          }
-
-          decorations.push({
-            range: createRangeFromPackageName(packageJsonDocument, packageName),
-            renderOptions: {
-              after: {
-                contentText:
-                  version !== latestVersion
-                    ? `new version available (${latestVersion})`
-                    : "up to date",
-                fontStyle: "italic",
-                color: "#888888",
-              },
-            },
+            hasCompletedOperations = true;
+            checkAndUpdateDecorations();
+          })
+          .catch((error) => {
+            log(`Error fetching package ${packageName}: ${error}`);
+            checkAndUpdateDecorations();
           });
+      }
+    }
 
-          editor?.setDecorations(decorationType, decorations);
-        });
-      });
+    if (pendingOperations === 0 && hasCompletedOperations) {
+      decorationTimeout = setTimeout(updateDecorations, 100);
     }
   });
 }
 
 export function deactivate() {
+  if (decorationTimeout) {
+    clearTimeout(decorationTimeout);
+  }
   decorationType.dispose();
   disposeLogger();
 }
